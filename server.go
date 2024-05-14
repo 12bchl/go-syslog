@@ -2,12 +2,10 @@ package syslog
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,55 +29,47 @@ const (
 type TlsPeerNameFunc func(tlsConn *tls.Conn) (tlsPeer string, ok bool)
 
 type Server struct {
-	listeners               []net.Listener
-	connections             []net.PacketConn
-	wait                    sync.WaitGroup
-	doneTcp                 chan bool
-	datagramChannelSize     int
-	datagramChannel         chan DatagramMessage
-	fastParser              Parser
-	format                  format.Format
-	handler                 Handler
+	listeners   []net.Listener
+	tcpParsers  []Parser
+	connections []net.Conn
+	udpParsers  []Parser
+	wait        sync.WaitGroup
+	done        chan bool
+	// datagramChannelSize     int
+	// datagramChannel         chan DatagramMessage
 	lastError               error
 	readTimeoutMilliseconds int64
 	tlsPeerNameFunc         TlsPeerNameFunc
-	datagramPool            sync.Pool
+	// datagramPool            sync.Pool
+	mu sync.Mutex
 }
 
 // External Parser, see "github.com/influxdata/go-syslog/v3"
 type Parser interface {
-	Parse(r io.Reader)
+	Parse(r io.Reader) error
 }
 
 // NewServer returns a new Server
 func NewServer() *Server {
-	return &Server{tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 65536)
-		},
-	},
+	return &Server{tlsPeerNameFunc: defaultTlsPeerName} // datagramPool: sync.Pool{
+	// New: func() interface{} {
+	// 	return make([]byte, 65536)
+	// },
 
-		datagramChannelSize: datagramChannelBufferSize,
-	}
+	// datagramChannelSize: datagramChannelBufferSize,
+
 }
 
-// Sets the optional external syslog parser. Overrides format & handler
-func (s *Server) SetParser(p Parser) {
-	s.fastParser = p
+func (s *Server) SetReceiver(millseconds int64) {
+	s.readTimeoutMilliseconds = millseconds
 }
 
-// Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
-func (s *Server) SetFormat(f format.Format) {
-	s.format = f
-}
-
-// Sets the handler, this handler with receive every syslog entry
-func (s *Server) SetHandler(handler Handler) {
-	s.handler = handler
+func (s *Server) SetTimeout(millseconds int64) {
+	s.readTimeoutMilliseconds = millseconds
 }
 
 // Sets the connection timeout for TCP connections, in milliseconds
-func (s *Server) SetTimeout(millseconds int64) {
+func (s *Server) SetChannel(millseconds int64) {
 	s.readTimeoutMilliseconds = millseconds
 }
 
@@ -88,9 +78,9 @@ func (s *Server) SetTlsPeerNameFunc(tlsPeerNameFunc TlsPeerNameFunc) {
 	s.tlsPeerNameFunc = tlsPeerNameFunc
 }
 
-func (s *Server) SetDatagramChannelSize(size int) {
-	s.datagramChannelSize = size
-}
+// func (s *Server) SetDatagramChannelSize(size int) {
+// 	s.datagramChannelSize = size
+// }
 
 // Default TLS peer name function - returns the CN of the certificate
 func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
@@ -103,7 +93,10 @@ func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 }
 
 // Configure the server for listen on an UDP addr
-func (s *Server) ListenUDP(addr string) error {
+func (s *Server) ListenUDP(addr string, parser Parser) error {
+	if parser == nil {
+		return errors.New("nil parser provided")
+	}
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -115,29 +108,41 @@ func (s *Server) ListenUDP(addr string) error {
 	}
 	connection.SetReadBuffer(datagramReadBufferSize)
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.connections = append(s.connections, connection)
+	s.udpParsers = append(s.udpParsers, parser)
 	return nil
 }
 
-// Configure the server for listen on an unix socket
-func (s *Server) ListenUnixgram(addr string) error {
-	unixAddr, err := net.ResolveUnixAddr("unixgram", addr)
-	if err != nil {
-		return err
-	}
-
-	connection, err := net.ListenUnixgram("unixgram", unixAddr)
-	if err != nil {
-		return err
-	}
-	connection.SetReadBuffer(datagramReadBufferSize)
-
-	s.connections = append(s.connections, connection)
-	return nil
-}
+// // Configure the server for listen on an unix socket
+// func (s *Server) ListenUnixgram(addr string, parser Parser) error {
+// 	if parser == nil {
+// 		return errors.New("nil parser provided")
+// 	}
+// 	unixAddr, err := net.ResolveUnixAddr("unixgram", addr)
+// 	if err != nil {
+// 		return err
+// 	}
+//
+// 	connection, err := net.ListenUnixgram("unixgram", unixAddr)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	connection.SetReadBuffer(datagramReadBufferSize)
+//
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+// 	s.connections = append(s.connections, connection)
+// 	s.udpParsers = append(s.udpParsers, parser)
+// 	return nil
+// }
 
 // Configure the server for listen on a TCP addr
-func (s *Server) ListenTCP(addr string) error {
+func (s *Server) ListenTCP(addr string, parser Parser) error {
+	if parser == nil {
+		return errors.New("nil parser provided")
+	}
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return err
@@ -148,57 +153,66 @@ func (s *Server) ListenTCP(addr string) error {
 		return err
 	}
 
-	s.doneTcp = make(chan bool)
+	s.done = make(chan bool)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.listeners = append(s.listeners, listener)
+	s.tcpParsers = append(s.tcpParsers, parser)
 	return nil
 }
 
 // Configure the server for listen on a TCP addr for TLS
-func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
+func (s *Server) ListenTCPTLS(addr string, config *tls.Config, parser Parser) error {
+	if parser == nil {
+		return errors.New("nil parser provided")
+	}
 	listener, err := tls.Listen("tcp", addr, config)
 	if err != nil {
 		return err
 	}
 
-	s.doneTcp = make(chan bool)
+	s.done = make(chan bool)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.listeners = append(s.listeners, listener)
+	s.tcpParsers = append(s.tcpParsers, parser)
 	return nil
 }
 
 // Starts the server, all the go routines goes to live
 func (s *Server) Boot() error {
-	if s.fastParser == nil {
-		if s.format == nil {
-			return errors.New("please set a valid format, or set an external parser")
-		}
-
-		if s.handler == nil {
-			return errors.New("please set a valid handler, or set an external parser")
-		}
+	if len(s.tcpParsers) != len(s.listeners) {
+		return errors.New("invalid number of tcp parsers")
 	}
 
-	for _, listener := range s.listeners {
-		s.goAcceptConnection(listener)
+	if len(s.udpParsers) != len(s.connections) {
+		return errors.New("invalid number of udp parsers")
 	}
 
-	if len(s.connections) > 0 {
-		s.goParseDatagrams()
+	for i, listener := range s.listeners {
+		s.goAcceptConnection(listener, s.tcpParsers[i])
 	}
 
-	for _, connection := range s.connections {
-		s.goReceiveDatagrams(connection)
+	// if len(s.connections) > 0 {
+	// 	s.goParseDatagrams()
+	// }
+
+	for i, connection := range s.connections {
+		s.goReceiveDatagrams(connection, s.udpParsers[i])
 	}
 
 	return nil
 }
 
-func (s *Server) goAcceptConnection(listener net.Listener) {
+func (s *Server) goAcceptConnection(listener net.Listener, parser Parser) {
 	s.wait.Add(1)
 	go func(listener net.Listener) {
 	loop:
 		for {
 			select {
-			case <-s.doneTcp:
+			case <-s.done:
 				break loop
 			default:
 			}
@@ -207,18 +221,18 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 				continue
 			}
 
-			s.goScanConnection(connection)
+			s.goScanConnection(connection, parser)
 		}
 
 		s.wait.Done()
 	}(listener)
 }
 
-func (s *Server) goScanConnection(connection net.Conn) {
-	scanner := bufio.NewScanner(connection)
-	if sf := s.format.GetSplitFunc(); sf != nil {
-		scanner.Split(sf)
-	}
+func (s *Server) goScanConnection(connection net.Conn, parser Parser) {
+	// scanner := bufio.NewScanner(connection)
+	// if sf := s.format.GetSplitFunc(); sf != nil {
+	// 	scanner.Split(sf)
+	// }
 
 	remoteAddr := connection.RemoteAddr()
 	var client string
@@ -243,63 +257,63 @@ func (s *Server) goScanConnection(connection net.Conn) {
 		}
 	}
 
-	var scanCloser *ScanCloser
-	scanCloser = &ScanCloser{scanner, connection}
+	_ = client // todo log these ?
+	_ = tlsPeer
+
+	// var scanCloser *ScanCloser
+	// scanCloser = &ScanCloser{scanner, connection}
 
 	s.wait.Add(1)
-	go s.scan(scanCloser, client, tlsPeer)
+	// go s.scan(scanCloser, client, tlsPeer)
+	go parser.Parse(connection)
 }
 
-func (s *Server) scan(scanCloser *ScanCloser, client string, tlsPeer string) {
+func (s *Server) scan(connection net.Conn, parser Parser) { //, scanCloser *ScanCloser, client string, tlsPeer string) {
 loop:
 	for {
 		select {
-		case <-s.doneTcp:
+		case <-s.done:
 			break loop
 		default:
 		}
 		if s.readTimeoutMilliseconds > 0 {
-			scanCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
+			connection.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		if scanCloser.Scan() {
-			s.parser([]byte(scanCloser.Text()), client, tlsPeer)
-		} else {
+		if err := parser.Parse(connection); err != nil {
 			break loop
+			// s.parser([]byte(scanCloser.Text()), client, tlsPeer)
+			// } else {
 		}
 	}
-	scanCloser.closer.Close()
-
+	connection.Close()
 	s.wait.Done()
 }
 
-func (s *Server) parser(line []byte, client string, tlsPeer string) {
-	if s.fastParser == nil {
-		parser := s.format.GetParser(line)
-		err := parser.Parse()
-		if err != nil {
-			s.lastError = err
-		}
+// func (s *Server) parser(line []byte, client string, tlsPeer string) {
+// 	parser := s.format.GetParser(line)
+// 	err := parser.Parse()
+// 	if err != nil {
+// 		s.lastError = err
+// 	}
+//
+// 	logParts := parser.Dump()
+// 	logParts["client"] = client
+// 	if logParts["hostname"] == "" && (s.format == RFC3164 || s.format == Automatic) {
+// 		if i := strings.Index(client, ":"); i > 1 {
+// 			logParts["hostname"] = client[:i]
+// 		} else {
+// 			logParts["hostname"] = client
+// 		}
+// 	}
+// 	logParts["tls_peer"] = tlsPeer
+//
+// 	s.handler.Handle(logParts, int64(len(line)), err)
+// }
 
-		logParts := parser.Dump()
-		logParts["client"] = client
-		if logParts["hostname"] == "" && (s.format == RFC3164 || s.format == Automatic) {
-			if i := strings.Index(client, ":"); i > 1 {
-				logParts["hostname"] = client[:i]
-			} else {
-				logParts["hostname"] = client
-			}
-		}
-		logParts["tls_peer"] = tlsPeer
-
-		s.handler.Handle(logParts, int64(len(line)), err)
-	}
-	s.fastParser.Parse(bytes.NewReader(line))
-}
-
-// Returns the last error
-func (s *Server) GetLastError() error {
-	return s.lastError
-}
+// // Returns the last error
+// func (s *Server) GetLastError() error {
+// 	return s.lastError
+// }
 
 // Kill the server
 func (s *Server) Kill() error {
@@ -317,12 +331,12 @@ func (s *Server) Kill() error {
 		}
 	}
 	// Only need to close channel once to broadcast to all waiting
-	if s.doneTcp != nil {
-		close(s.doneTcp)
+	if s.done != nil {
+		close(s.done)
 	}
-	if s.datagramChannel != nil {
-		close(s.datagramChannel)
-	}
+	// if s.datagramChannel != nil {
+	// 	close(s.datagramChannel)
+	// }
 	return nil
 }
 
@@ -346,25 +360,41 @@ type DatagramMessage struct {
 	client  string
 }
 
-func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
+// type PacketReader struct {
+// 	net.PacketConn
+// }
+//
+// func (pkr PacketReader) Read(p []byte) (n int, err error) {
+// 	n, _, err = pkr.ReadFrom(p)
+// 	return
+// }
+
+func (s *Server) goReceiveDatagrams(conn net.Conn, parser Parser) {
 	s.wait.Add(1)
 	go func() {
 		defer s.wait.Done()
 		for {
-			buf := s.datagramPool.Get().([]byte)
-			n, addr, err := packetconn.ReadFrom(buf)
-			if err == nil {
-				// Ignore trailing control characters and NULs
-				for ; (n > 0) && (buf[n-1] < 32); n-- {
-				}
-				if n > 0 {
-					var address string
-					if addr != nil {
-						address = addr.String()
-					}
-					s.datagramChannel <- DatagramMessage{buf[:n], address}
-				}
-			} else {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			err := parser.Parse(conn)
+			// // buf := s.datagramPool.Get().([]byte)
+			// n, addr, err := conn.ReadFrom(buf)
+			//
+			// if err == nil {
+			// 	// Ignore trailing control characters and NULs
+			// 	for ; (n > 0) && (buf[n-1] < 32); n-- {
+			// 	}
+			// 	if n > 0 {
+			// 		var address string
+			// 		if addr != nil {
+			// 			address = addr.String()
+			// 		}
+			// 		s.datagramChannel <- DatagramMessage{buf[:n], address}
+			// 	}
+			if err != nil {
 				// there has been an error. Either the server has been killed
 				// or may be getting a transitory error due to (e.g.) the
 				// interface being shutdown in which case sleep() to avoid busy wait.
@@ -378,27 +408,27 @@ func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
 	}()
 }
 
-func (s *Server) goParseDatagrams() {
-	s.datagramChannel = make(chan DatagramMessage, s.datagramChannelSize)
-
-	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
-		for {
-			select {
-			case msg, ok := (<-s.datagramChannel):
-				if !ok {
-					return
-				}
-				if sf := s.format.GetSplitFunc(); sf != nil {
-					if _, token, err := sf(msg.message, true); err == nil {
-						s.parser(token, msg.client, "")
-					}
-				} else {
-					s.parser(msg.message, msg.client, "")
-				}
-				s.datagramPool.Put(msg.message[:cap(msg.message)])
-			}
-		}
-	}()
-}
+// func (s *Server) goParseDatagrams() {
+// 	s.datagramChannel = make(chan DatagramMessage, s.datagramChannelSize)
+//
+// 	s.wait.Add(1)
+// 	go func() {
+// 		defer s.wait.Done()
+// 		for {
+// 			select {
+// 			case msg, ok := (<-s.datagramChannel):
+// 				if !ok {
+// 					return
+// 				}
+// 				if sf := s.format.GetSplitFunc(); sf != nil {
+// 					if _, token, err := sf(msg.message, true); err == nil {
+// 						s.parser(token, msg.client, "")
+// 					}
+// 				} else {
+// 					s.parser(msg.message, msg.client, "")
+// 				}
+// 				s.datagramPool.Put(msg.message[:cap(msg.message)])
+// 			}
+// 		}
+// 	}()
+// }
